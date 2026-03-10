@@ -9,9 +9,18 @@ import SwiftUI
 
 @main
 struct HABarApp: App {
+    @StateObject private var store = HomeAssistantStore()
+
     var body: some Scene {
-        WindowGroup {
-            ContentView()
+        MenuBarExtra {
+            MenuBarContentView(store: store)
+        } label: {
+            MenuBarStatusView(store: store)
+        }
+        .menuBarExtraStyle(.window)
+
+        Settings {
+            SettingsView(store: store)
         }
     }
 }
