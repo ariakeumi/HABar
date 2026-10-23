@@ -23,7 +23,8 @@ struct MenuBarContentView: View {
                                     sensor: selection.sensor,
                                     points: store.historyPoints(for: selection.entityID),
                                     range: store.configuration.historyRange,
-                                    color: store.chartColor(at: selection.slotIndex).swiftUIColor
+                                    color: store.chartColor(at: selection.slotIndex).swiftUIColor,
+                                    isLoading: store.isLoadingHistory
                                 )
                                 .frame(width: 350)
                                 Spacer(minLength: 0)
@@ -35,7 +36,7 @@ struct MenuBarContentView: View {
                 onboarding
             }
 
-            if let errorMessage = store.errorMessage {
+            if let errorMessage = store.errorMessage ?? store.historyErrorMessage {
                 Text(errorMessage)
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -65,7 +66,7 @@ struct MenuBarContentView: View {
             Spacer()
 
             HStack(spacing: 8) {
-                if store.isRefreshing {
+                if store.isRefreshing || store.isLoadingHistory {
                     ProgressView()
                         .controlSize(.small)
                         .frame(width: 28, height: 28)

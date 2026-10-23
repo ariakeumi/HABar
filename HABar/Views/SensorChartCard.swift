@@ -6,6 +6,7 @@ struct SensorChartCard: View {
     let points: [SensorHistoryPoint]
     let range: HistoryRange
     let color: Color
+    var isLoading = false
     @State private var hoveredPoint: SensorHistoryPoint?
 
     var body: some View {
@@ -121,7 +122,7 @@ struct SensorChartCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             } else {
-                Text("这个传感器还没有足够的历史数据可绘图。")
+                Text(isLoading ? "正在加载历史数据…" : "这个传感器还没有足够的历史数据可绘图。")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }

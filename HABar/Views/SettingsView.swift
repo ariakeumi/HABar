@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var store: HomeAssistantStore
+    @State private var sensorSelection: SensorSelectionTarget?
 
     var body: some View {
         Form {
@@ -54,7 +55,7 @@ struct SettingsView: View {
             }
 
             Section("菜单栏显示（1-3 个）") {
-                sensorSelectionContent(count: HAConfiguration.menuBarSlotCount, selection: store.menuBarSelection(at:), setter: store.setMenuBarSensor(_:at:), titlePrefix: "菜单栏")
+                sensorSelectionContent(count: HAConfiguration.menuBarSlotCount, selection: store.menuBarSelection(at:), titlePrefix: "菜单栏")
             }
 
             Section("卡片界面图表（1-4 个）") {
@@ -96,13 +97,27 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 620)
         .padding(20)
+        .sheet(item: $sensorSelection) { target in
+            SensorSelectionView(
+                sensors: store.availableSensors,
+                selectedEntityID: target.isChart
+                    ? store.chartSelection(at: target.index)
+                    : store.menuBarSelection(at: target.index)
+            ) { entityID in
+                if target.isChart {
+                    store.setChartSensor(entityID, at: target.index)
+                } else {
+                    store.setMenuBarSensor(entityID, at: target.index)
+                }
+                sensorSelection = nil
+            }
+        }
     }
 
     @ViewBuilder
     private func sensorSelectionContent(
         count: Int,
         selection: @escaping (Int) -> String,
-        setter: @escaping (String, Int) -> Void,
         titlePrefix: String
     ) -> some View {
         if store.availableSensors.isEmpty {
@@ -110,14 +125,8 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
         } else {
             ForEach(0..<count, id: \.self) { index in
-                Picker("\(titlePrefix) \(index + 1)", selection: Binding(
-                    get: { selection(index) },
-                    set: { setter($0, index) }
-                )) {
-                    Text("不显示").tag("")
-                    ForEach(store.sensorCandidates()) { sensor in
-                        Text(sensorOptionLabel(sensor)).tag(sensor.entityID)
-                    }
+                LabeledContent("\(titlePrefix) \(index + 1)") {
+                    sensorSelectionButton(entityID: selection(index), index: index, isChart: false)
                 }
             }
         }
@@ -131,14 +140,8 @@ struct SettingsView: View {
         } else {
             ForEach(0..<HAConfiguration.chartSlotCount, id: \.self) { index in
                 VStack(alignment: .leading, spacing: 8) {
-                    Picker("图表 \(index + 1)", selection: Binding(
-                        get: { store.chartSelection(at: index) },
-                        set: { store.setChartSensor($0, at: index) }
-                    )) {
-                        Text("不显示").tag("")
-                        ForEach(store.sensorCandidates()) { sensor in
-                            Text(sensorOptionLabel(sensor)).tag(sensor.entityID)
-                        }
+                    LabeledContent("图表 \(index + 1)") {
+                        sensorSelectionButton(entityID: store.chartSelection(at: index), index: index, isChart: true)
                     }
 
                     Picker("颜色", selection: Binding(
@@ -156,11 +159,27 @@ struct SettingsView: View {
         }
     }
 
-    private func sensorOptionLabel(_ sensor: SensorDescriptor) -> String {
-        if sensor.unit.isEmpty {
-            return sensor.name
+    private func sensorSelectionButton(entityID: String, index: Int, isChart: Bool) -> some View {
+        let sensor = store.availableSensors.first { $0.entityID == entityID }
+        let label = entityID.isEmpty ? "不显示" : sensor?.name ?? entityID
+        return Button {
+            sensorSelection = SensorSelectionTarget(index: index, isChart: isChart)
+        } label: {
+            HStack {
+                Text(label)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption)
+            }
         }
-
-        return "\(sensor.name) (\(sensor.unit))"
+        .accessibilityLabel("选择传感器：\(label)")
     }
+}
+
+private struct SensorSelectionTarget: Identifiable {
+    let index: Int
+    let isChart: Bool
+
+    var id: String { "\(isChart)-\(index)" }
 }

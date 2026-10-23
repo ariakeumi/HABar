@@ -13,14 +13,14 @@ struct HABarApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuBarContentView(store: store)
+            MenuBarPanelView(store: store)
         } label: {
             MenuBarStatusView(store: store)
         }
         .menuBarExtraStyle(.window)
 
         Settings {
-            SettingsView(store: store)
+            SettingsWindowView(store: store)
         }
     }
 }

@@ -8,6 +8,8 @@ final class HomeAssistantStore: ObservableObject {
     @Published private(set) var availableSensors: [SensorDescriptor] = []
     @Published private(set) var historyByEntityID: [String: [SensorHistoryPoint]] = [:]
     @Published private(set) var isRefreshing = false
+    @Published private(set) var isLoadingHistory = false
+    @Published private(set) var historyErrorMessage: String?
     @Published private(set) var lastRefresh: Date?
     @Published private(set) var launchAtLoginEnabled = false
     @Published private(set) var launchAtLoginRequiresApproval = false
@@ -22,12 +24,19 @@ final class HomeAssistantStore: ObservableObject {
     private var autoRefreshTask: Task<Void, Never>?
     private var historyRefreshTask: Task<Void, Never>?
     private var pendingRefreshAfterCurrent = false
+    private var isChartPanelVisible = false
+    private var historyGeneration = 0
 
-    init(api: HomeAssistantAPI? = nil) {
+    init(
+        api: HomeAssistantAPI? = nil,
+        configuration: HAConfiguration? = nil,
+        token: String? = nil,
+        automaticallyRefresh: Bool = true
+    ) {
         self.api = api ?? HomeAssistantAPI()
 
-        let configuration = HAConfiguration.load()
-        let token = KeychainStore.loadToken()
+        let configuration = configuration ?? HAConfiguration.load()
+        let token = token ?? KeychainStore.loadToken()
 
         self.configuration = configuration
         self.savedToken = token
@@ -35,10 +44,11 @@ final class HomeAssistantStore: ObservableObject {
         self.draftToken = token
 
         refreshLaunchAtLoginStatus()
-        startAutoRefresh()
-
-        initialRefreshTask = Task { [weak self] in
-            await self?.refresh()
+        if automaticallyRefresh {
+            startAutoRefresh()
+            initialRefreshTask = Task { [weak self] in
+                await self?.refresh()
+            }
         }
     }
 
@@ -104,6 +114,7 @@ final class HomeAssistantStore: ObservableObject {
     }
 
     func saveConnectionSettings() async {
+        cancelHistoryRefresh(clearHistory: true)
         objectWillChange.send()
         configuration.baseURLString = draftBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         configuration.save()
@@ -131,12 +142,9 @@ final class HomeAssistantStore: ObservableObject {
 
         repeat {
             pendingRefreshAfterCurrent = false
-            historyRefreshTask?.cancel()
-            historyRefreshTask = nil
-
             guard let baseURL = configuration.normalizedBaseURL, !savedToken.isEmpty else {
                 availableSensors = []
-                historyByEntityID = [:]
+                cancelHistoryRefresh(clearHistory: true)
                 errorMessage = "请先在设置中填写 Home Assistant 地址和长期访问令牌。"
                 return
             }
@@ -149,11 +157,13 @@ final class HomeAssistantStore: ObservableObject {
                         lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
                     }
 
-                availableSensors = sensors
+                if availableSensors != sensors {
+                    availableSensors = sensors
+                }
                 lastRefresh = Date()
                 errorMessage = nil
 
-                await refreshHistory(baseURL: baseURL, token: savedToken)
+                scheduleHistoryRefresh()
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -179,6 +189,7 @@ final class HomeAssistantStore: ObservableObject {
         configuration.chartEntityIDs[index] = entityID.trimmingCharacters(in: .whitespacesAndNewlines)
         configuration.save()
 
+        historyByEntityID = [:]
         scheduleHistoryRefresh()
     }
 
@@ -210,6 +221,7 @@ final class HomeAssistantStore: ObservableObject {
         configuration.historyRange = range
         configuration.save()
 
+        historyByEntityID = [:]
         scheduleHistoryRefresh()
     }
 
@@ -232,30 +244,28 @@ final class HomeAssistantStore: ObservableObject {
         SMAppService.openSystemSettingsLoginItems()
     }
 
-    func sensorCandidates() -> [SensorDescriptor] {
-        availableSensors
+    func setChartPanelVisible(_ visible: Bool) {
+        guard isChartPanelVisible != visible else { return }
+        isChartPanelVisible = visible
+        if visible {
+            scheduleHistoryRefresh()
+        } else {
+            cancelHistoryRefresh(clearHistory: true)
+        }
     }
 
-    private func refreshHistoryOnly() async {
-        if isRefreshing {
-            pendingRefreshAfterCurrent = true
-            return
-        }
-
-        guard let baseURL = configuration.normalizedBaseURL, !savedToken.isEmpty else {
-            historyByEntityID = [:]
-            return
-        }
-
-        await refreshHistory(baseURL: baseURL, token: savedToken)
-    }
-
-    private func refreshHistory(baseURL: URL, token: String) async {
-        let entityIDs = Array(NSOrderedSet(array: configuration.chartEntityIDs.filter { !$0.isEmpty })) as? [String] ?? []
-
-        guard !entityIDs.isEmpty else {
-            historyByEntityID = [:]
-            return
+    private func refreshHistory(
+        baseURL: URL,
+        token: String,
+        entityIDs: [String],
+        range: HistoryRange,
+        generation: Int
+    ) async {
+        defer {
+            if historyGeneration == generation {
+                isLoadingHistory = false
+                historyRefreshTask = nil
+            }
         }
 
         var newHistory: [String: [SensorHistoryPoint]] = [:]
@@ -270,7 +280,7 @@ final class HomeAssistantStore: ObservableObject {
                     baseURL: baseURL,
                     token: token,
                     entityID: entityID,
-                    range: configuration.historyRange
+                    range: range
                 )
                 guard !Task.isCancelled else { return }
                 newHistory[entityID] = points
@@ -284,25 +294,56 @@ final class HomeAssistantStore: ObservableObject {
             }
         }
 
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, isChartPanelVisible, historyGeneration == generation else { return }
         historyByEntityID = newHistory
 
         if historyFailed {
             if let firstHistoryError, !firstHistoryError.isEmpty {
-                errorMessage = firstHistoryError
+                historyErrorMessage = firstHistoryError
             } else {
-                errorMessage = "当前值已更新，但部分历史记录读取失败。"
+                historyErrorMessage = "当前值已更新，但部分历史记录读取失败。"
             }
         } else {
-            errorMessage = nil
+            historyErrorMessage = nil
         }
     }
 
     private func scheduleHistoryRefresh() {
-        historyRefreshTask?.cancel()
-        historyRefreshTask = Task { [weak self] in
-            await self?.refreshHistoryOnly()
+        cancelHistoryRefresh(clearHistory: false)
+        guard isChartPanelVisible,
+              let baseURL = configuration.normalizedBaseURL,
+              !savedToken.isEmpty else { return }
+
+        let entityIDs = configuration.chartEntityIDs.reduce(into: [String]()) { result, id in
+            if !id.isEmpty, !result.contains(id) { result.append(id) }
         }
+        guard !entityIDs.isEmpty else {
+            historyByEntityID = [:]
+            return
+        }
+
+        let generation = historyGeneration
+        let range = configuration.historyRange
+        let token = savedToken
+        isLoadingHistory = true
+        historyRefreshTask = Task { [weak self] in
+            await self?.refreshHistory(
+                baseURL: baseURL,
+                token: token,
+                entityIDs: entityIDs,
+                range: range,
+                generation: generation
+            )
+        }
+    }
+
+    private func cancelHistoryRefresh(clearHistory: Bool) {
+        historyGeneration += 1
+        historyRefreshTask?.cancel()
+        historyRefreshTask = nil
+        isLoadingHistory = false
+        historyErrorMessage = nil
+        if clearHistory { historyByEntityID = [:] }
     }
 
     func menuBarSelection(at index: Int) -> String {

@@ -183,6 +183,7 @@ struct HomeAssistantAPI {
 
             return points.isEmpty ? nil : points
         } catch {
+            try Task.checkCancellation()
             return nil
         }
     }
@@ -212,68 +213,73 @@ struct HomeAssistantAPI {
             websocketSession.invalidateAndCancel()
         }
 
-        let authRequired = try await receiveJSONObject(from: task)
-        guard (authRequired["type"] as? String) == "auth_required" else {
-            throw HomeAssistantAPIError.invalidResponse
-        }
-
-        try await sendJSONObject(
-            [
-                "type": "auth",
-                "access_token": token,
-            ],
-            to: task
-        )
-
-        let authResponse = try await receiveJSONObject(from: task)
-        switch authResponse["type"] as? String {
-        case "auth_ok":
-            break
-        case "auth_invalid":
-            throw HomeAssistantAPIError.unauthorized
-        default:
-            throw HomeAssistantAPIError.invalidResponse
-        }
-
-        try await sendJSONObject(
-            statisticsCommand(
-                id: 1,
-                entityID: entityID,
-                range: range,
-                startDate: startDate,
-                endDate: endDate
-            ),
-            to: task
-        )
-
-        while true {
+        return try await withTaskCancellationHandler {
             try Task.checkCancellation()
-            let message = try await receiveJSONObject(from: task)
-            guard let type = message["type"] as? String else {
-                continue
+            let authRequired = try await receiveJSONObject(from: task)
+            guard (authRequired["type"] as? String) == "auth_required" else {
+                throw HomeAssistantAPIError.invalidResponse
             }
 
-            switch type {
-            case "event":
-                continue
-            case "result":
-                guard (message["id"] as? Int) == 1 else {
+            try await sendJSONObject(
+                [
+                    "type": "auth",
+                    "access_token": token,
+                ],
+                to: task
+            )
+
+            let authResponse = try await receiveJSONObject(from: task)
+            switch authResponse["type"] as? String {
+            case "auth_ok":
+                break
+            case "auth_invalid":
+                throw HomeAssistantAPIError.unauthorized
+            default:
+                throw HomeAssistantAPIError.invalidResponse
+            }
+
+            try await sendJSONObject(
+                statisticsCommand(
+                    id: 1,
+                    entityID: entityID,
+                    range: range,
+                    startDate: startDate,
+                    endDate: endDate
+                ),
+                to: task
+            )
+
+            while true {
+                try Task.checkCancellation()
+                let message = try await receiveJSONObject(from: task)
+                guard let type = message["type"] as? String else {
                     continue
                 }
 
-                guard (message["success"] as? Bool) == true else {
-                    throw HomeAssistantAPIError.invalidResponse
-                }
+                switch type {
+                case "event":
+                    continue
+                case "result":
+                    guard (message["id"] as? Int) == 1 else {
+                        continue
+                    }
 
-                return statisticsPoints(
-                    from: message["result"],
-                    entityID: entityID,
-                    startDate: startDate,
-                    endDate: endDate
-                )
-            default:
-                continue
+                    guard (message["success"] as? Bool) == true else {
+                        throw HomeAssistantAPIError.invalidResponse
+                    }
+
+                    return statisticsPoints(
+                        from: message["result"],
+                        entityID: entityID,
+                        startDate: startDate,
+                        endDate: endDate
+                    )
+                default:
+                    continue
+                }
             }
+        } onCancel: {
+            task.cancel(with: .goingAway, reason: nil)
         }
     }
 
@@ -405,6 +411,7 @@ struct HomeAssistantAPI {
 
             group.addTask {
                 try await Task.sleep(for: .seconds(12))
+                task.cancel(with: .goingAway, reason: nil)
                 throw HomeAssistantAPIError.requestTimedOut
             }
 
