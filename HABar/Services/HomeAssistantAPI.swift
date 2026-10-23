@@ -4,6 +4,7 @@ enum HomeAssistantAPIError: LocalizedError {
     case invalidBaseURL
     case invalidResponse
     case unauthorized
+    case requestTimedOut
     case http(statusCode: Int, message: String?)
 
     var errorDescription: String? {
@@ -14,6 +15,8 @@ enum HomeAssistantAPIError: LocalizedError {
             return "Home Assistant 返回了无法识别的数据。"
         case .unauthorized:
             return "Home Assistant 认证失败，请检查长期访问令牌。"
+        case .requestTimedOut:
+            return "Home Assistant 请求超时。"
         case let .http(statusCode, message):
             if let message, !message.isEmpty {
                 return "Home Assistant 请求失败（\(statusCode)）：\(message)"
@@ -196,7 +199,11 @@ struct HomeAssistantAPI {
             throw HomeAssistantAPIError.invalidBaseURL
         }
 
-        let websocketSession = URLSession(configuration: .ephemeral)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 12
+        configuration.timeoutIntervalForResource = 20
+
+        let websocketSession = URLSession(configuration: configuration)
         let task = websocketSession.webSocketTask(with: websocketURL)
         task.resume()
 
@@ -240,6 +247,7 @@ struct HomeAssistantAPI {
         )
 
         while true {
+            try Task.checkCancellation()
             let message = try await receiveJSONObject(from: task)
             guard let type = message["type"] as? String else {
                 continue
@@ -363,7 +371,7 @@ struct HomeAssistantAPI {
     private func receiveJSONObject(
         from task: URLSessionWebSocketTask
     ) async throws -> [String: Any] {
-        let message = try await task.receive()
+        let message = try await receiveWebSocketMessage(from: task)
         let data: Data
 
         switch message {
@@ -383,6 +391,29 @@ struct HomeAssistantAPI {
         }
 
         return json
+    }
+
+    private func receiveWebSocketMessage(
+        from task: URLSessionWebSocketTask
+    ) async throws -> URLSessionWebSocketTask.Message {
+        try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
+            defer { group.cancelAll() }
+
+            group.addTask {
+                try await task.receive()
+            }
+
+            group.addTask {
+                try await Task.sleep(for: .seconds(12))
+                throw HomeAssistantAPIError.requestTimedOut
+            }
+
+            guard let message = try await group.next() else {
+                throw HomeAssistantAPIError.invalidResponse
+            }
+
+            return message
+        }
     }
 
     private func statisticsPoints(

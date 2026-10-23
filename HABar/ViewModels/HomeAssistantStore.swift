@@ -18,7 +18,10 @@ final class HomeAssistantStore: ObservableObject {
 
     private let api: HomeAssistantAPI
     private var savedToken: String
+    private var initialRefreshTask: Task<Void, Never>?
     private var autoRefreshTask: Task<Void, Never>?
+    private var historyRefreshTask: Task<Void, Never>?
+    private var pendingRefreshAfterCurrent = false
 
     init(api: HomeAssistantAPI? = nil) {
         self.api = api ?? HomeAssistantAPI()
@@ -34,13 +37,15 @@ final class HomeAssistantStore: ObservableObject {
         refreshLaunchAtLoginStatus()
         startAutoRefresh()
 
-        Task {
-            await refresh()
+        initialRefreshTask = Task { [weak self] in
+            await self?.refresh()
         }
     }
 
     deinit {
+        initialRefreshTask?.cancel()
         autoRefreshTask?.cancel()
+        historyRefreshTask?.cancel()
     }
 
     var menuBarText: String {
@@ -116,32 +121,43 @@ final class HomeAssistantStore: ObservableObject {
     }
 
     func refresh() async {
-        guard let baseURL = configuration.normalizedBaseURL, !savedToken.isEmpty else {
-            availableSensors = []
-            historyByEntityID = [:]
-            errorMessage = "请先在设置中填写 Home Assistant 地址和长期访问令牌。"
+        if isRefreshing {
+            pendingRefreshAfterCurrent = true
             return
         }
 
         isRefreshing = true
         defer { isRefreshing = false }
 
-        do {
-            let states = try await api.fetchStates(baseURL: baseURL, token: savedToken)
-            let sensors = states
-                .compactMap(SensorDescriptor.init(entity:))
-                .sorted { lhs, rhs in
-                    lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-                }
+        repeat {
+            pendingRefreshAfterCurrent = false
+            historyRefreshTask?.cancel()
+            historyRefreshTask = nil
 
-            availableSensors = sensors
-            lastRefresh = Date()
-            errorMessage = nil
+            guard let baseURL = configuration.normalizedBaseURL, !savedToken.isEmpty else {
+                availableSensors = []
+                historyByEntityID = [:]
+                errorMessage = "请先在设置中填写 Home Assistant 地址和长期访问令牌。"
+                return
+            }
 
-            await refreshHistory(baseURL: baseURL, token: savedToken)
-        } catch {
-            errorMessage = error.localizedDescription
-        }
+            do {
+                let states = try await api.fetchStates(baseURL: baseURL, token: savedToken)
+                let sensors = states
+                    .compactMap(SensorDescriptor.init(entity:))
+                    .sorted { lhs, rhs in
+                        lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                    }
+
+                availableSensors = sensors
+                lastRefresh = Date()
+                errorMessage = nil
+
+                await refreshHistory(baseURL: baseURL, token: savedToken)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        } while pendingRefreshAfterCurrent && !Task.isCancelled
     }
 
     func setMenuBarSensor(_ entityID: String, at index: Int) {
@@ -163,9 +179,7 @@ final class HomeAssistantStore: ObservableObject {
         configuration.chartEntityIDs[index] = entityID.trimmingCharacters(in: .whitespacesAndNewlines)
         configuration.save()
 
-        Task {
-            await refreshHistoryOnly()
-        }
+        scheduleHistoryRefresh()
     }
 
     func chartColor(at index: Int) -> ChartColorOption {
@@ -196,9 +210,7 @@ final class HomeAssistantStore: ObservableObject {
         configuration.historyRange = range
         configuration.save()
 
-        Task {
-            await refreshHistoryOnly()
-        }
+        scheduleHistoryRefresh()
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -225,6 +237,11 @@ final class HomeAssistantStore: ObservableObject {
     }
 
     private func refreshHistoryOnly() async {
+        if isRefreshing {
+            pendingRefreshAfterCurrent = true
+            return
+        }
+
         guard let baseURL = configuration.normalizedBaseURL, !savedToken.isEmpty else {
             historyByEntityID = [:]
             return
@@ -246,14 +263,19 @@ final class HomeAssistantStore: ObservableObject {
         var firstHistoryError: String?
 
         for entityID in entityIDs {
+            guard !Task.isCancelled else { return }
+
             do {
-                newHistory[entityID] = try await api.fetchHistory(
+                let points = try await api.fetchHistory(
                     baseURL: baseURL,
                     token: token,
                     entityID: entityID,
                     range: configuration.historyRange
                 )
+                guard !Task.isCancelled else { return }
+                newHistory[entityID] = points
             } catch {
+                guard !Task.isCancelled else { return }
                 historyFailed = true
                 if firstHistoryError == nil {
                     firstHistoryError = error.localizedDescription
@@ -262,6 +284,7 @@ final class HomeAssistantStore: ObservableObject {
             }
         }
 
+        guard !Task.isCancelled else { return }
         historyByEntityID = newHistory
 
         if historyFailed {
@@ -272,6 +295,13 @@ final class HomeAssistantStore: ObservableObject {
             }
         } else {
             errorMessage = nil
+        }
+    }
+
+    private func scheduleHistoryRefresh() {
+        historyRefreshTask?.cancel()
+        historyRefreshTask = Task { [weak self] in
+            await self?.refreshHistoryOnly()
         }
     }
 
@@ -339,7 +369,12 @@ final class HomeAssistantStore: ObservableObject {
         autoRefreshTask?.cancel()
         autoRefreshTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(60))
+                do {
+                    try await Task.sleep(for: .seconds(60))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
                 guard let self else { return }
                 await self.refresh()
             }
